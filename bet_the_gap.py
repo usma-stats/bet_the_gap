@@ -102,13 +102,62 @@ def settle(side: str, wager: int):
         t = class_tally()
         with t["lock"]:
             t["finals"].append(max(0, st.session_state.bankroll))
+    update_board()
 
 
 @st.cache_resource
 def class_tally():
     """One tally shared by every browser connected to this server (the class)."""
     return dict(lock=threading.Lock(), players=set(), beatable=0, value_won=0,
-                took_value=0, gaps=0, gaps_over_mean=0, finals=[])
+                took_value=0, gaps=0, gaps_over_mean=0, finals=[],
+                board={})  # leaderboard: callsign (lowercased) -> entry dict
+
+
+def update_board():
+    """Write this player's current game to the shared leaderboard."""
+    s = st.session_state
+    if not s.get("callsign"):
+        return
+    hist = s.history
+    beatable = [h for h in hist if h["kind"] != "fair"]
+    status = ("busted" if s.bankroll <= 0 else
+              "finished" if s.game_over else "playing")
+    t = class_tally()
+    with t["lock"]:
+        t["board"][s.callsign.lower()] = dict(
+            pid=s.pid, name=s.callsign, bankroll=s.bankroll, round=len(hist),
+            beatable=len(beatable), took_value=sum(h["took_correct"] for h in beatable),
+            status=status, games=s.get("games", 1))
+
+
+def board_rows():
+    t = class_tally()
+    with t["lock"]:
+        entries = [dict(e) for e in t["board"].values()]
+    entries.sort(key=lambda e: (-e["bankroll"], -e["round"]))
+    return entries
+
+
+def leaderboard(big=False):
+    rows = board_rows()
+    if not rows:
+        st.write("No players yet. Enter a callsign to get on the board.")
+        return
+    me = st.session_state.get("callsign", "").lower()
+    table = [{
+        "Rank": i + 1,
+        "Callsign": ("➤ " if e["name"].lower() == me and not big else "") + e["name"],
+        "Bankroll": e["bankroll"],
+        "Round": f"{e['round']}/{ROUNDS}",
+        "Bet the value side": (f"{e['took_value'] / e['beatable']:.0%}"
+                               if e["beatable"] else "—"),
+        "Status": e["status"] + (f" (game {e['games']})" if e["games"] > 1 else ""),
+    } for i, e in enumerate(rows)]
+    st.dataframe(table, hide_index=True, use_container_width=True,
+                 height=min(38 * (len(table) + 1) + 4, 900 if big else 420))
+    st.caption("Ranked by bankroll. \"Bet the value side\" is how often a player "
+               "took the math-favored side on beatable lines. Over 20 rounds luck "
+               "can beat skill, but that column shows who played it right.")
 
 
 def record_round(h, lam):
@@ -157,13 +206,26 @@ def class_panel():
     if INSTRUCTOR and st.button("🗑️ Reset class tally (instructor)"):
         with t["lock"]:
             t.update(players=set(), beatable=0, value_won=0, took_value=0,
-                     gaps=0, gaps_over_mean=0, finals=[])
+                     gaps=0, gaps_over_mean=0, finals=[], board={})
         st.rerun()
 
 
 # ---------------- app ----------------
-# open with ?instructor=1 to expand the class panel and show its reset button
+# ?instructor=1  expands the class panel and shows the reset button
+# ?view=board    projector view: leaderboard + class results, auto-refreshing
 INSTRUCTOR = st.query_params.get("instructor") == "1"
+if st.query_params.get("view") == "board":
+    st.title("🏆 Bet the Gap — Leaderboard")
+
+    @st.fragment(run_every="3s")
+    def projector():
+        leaderboard(big=True)
+        class_panel()
+
+    INSTRUCTOR = True  # the projector view always shows the class panel open
+    projector()
+    st.stop()
+
 if "pid" not in st.session_state:
     st.session_state.pid = uuid.uuid4().hex
 if "lam" not in st.session_state:
@@ -198,6 +260,26 @@ mode** to get an explanation after every round; turn it off to test yourself.
         """
     )
 
+# ---------------- callsign gate ----------------
+if not st.session_state.get("callsign"):
+    with st.form("join"):
+        name = st.text_input("Your callsign (this is what the leaderboard shows)",
+                             max_chars=20, placeholder="e.g. CDT Smith")
+        joined = st.form_submit_button("Join the game", type="primary")
+    if joined:
+        name = " ".join(name.split())
+        taken = class_tally()["board"].get(name.lower())
+        if not name:
+            st.error("Enter a callsign first.")
+        elif taken and taken["pid"] != st.session_state.pid:
+            st.error(f"\"{name}\" is already on the board. Pick a different callsign.")
+        else:
+            st.session_state.callsign = name
+            st.session_state.games = 1
+            update_board()
+            st.rerun()
+    st.stop()
+
 left, right = st.columns([2, 1])
 
 with left:
@@ -220,8 +302,13 @@ with left:
     st.caption("Use this history to judge the typical time between calls before you bet.")
 
 with right:
-    st.metric("Bankroll", st.session_state.bankroll)
-    st.caption(f"Round {len(st.session_state.history)} of {ROUNDS}")
+    ranking = [e["name"].lower() for e in board_rows()]
+    me = st.session_state.callsign.lower()
+    place = f"#{ranking.index(me) + 1} of {len(ranking)}" if me in ranking else None
+    st.metric("Bankroll", st.session_state.bankroll, help="Leaderboard place: " + (place or "—"))
+    st.caption(f"**{st.session_state.callsign}** · Round "
+               f"{len(st.session_state.history)} of {ROUNDS}"
+               + (f" · leaderboard {place}" if place else ""))
     training = st.toggle("Training mode (explain each line)", value=True)
     if training:
         g = np.array(st.session_state.gaps)
@@ -231,7 +318,9 @@ with right:
         st.caption("Notice the median sits below the average. For any "
                    "exponential, median ≈ 0.69 × mean.")
     if st.button("🔄 New game (new hidden rate)"):
-        new_game(); st.rerun()
+        new_game()
+        st.session_state.games = st.session_state.get("games", 1) + 1
+        update_board(); st.rerun()
 
 st.divider()
 
@@ -313,4 +402,6 @@ if len(st.session_state.history) >= 5:
                      f"down when there is none.")
         st.line_chart([START_BANKROLL] + [h["bankroll"] for h in hist])
 
+with st.expander("🏆 Leaderboard", expanded=st.session_state.game_over):
+    leaderboard()
 class_panel()
