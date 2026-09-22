@@ -210,6 +210,34 @@ def class_panel():
         st.rerun()
 
 
+def gap_distribution(g, training):
+    """Histogram + density of every observed gap; grows by one gap each round."""
+    top = float(g.max()) * 1.1
+    fig, ax = plt.subplots(figsize=(9, 2.6), dpi=110)
+    ax.hist(g, bins=np.histogram_bin_edges(g, bins="auto", range=(0, top)),
+            density=True, color="tab:blue", alpha=0.35, edgecolor="white")
+    # Gaussian KDE reflected at 0 so the curve doesn't leak into negative gaps
+    x = np.linspace(0, top, 300)
+    bw = max(1.06 * g.std() * len(g) ** -0.2, 1e-6)
+    k = lambda u: np.exp(-0.5 * u ** 2) / math.sqrt(2 * math.pi)
+    dens = (k((x[:, None] - g) / bw) + k((x[:, None] + g) / bw)).sum(1) / (len(g) * bw)
+    ax.plot(x, dens, color="tab:blue", lw=2)
+    ax.plot(g, np.zeros_like(g), "|", color="tab:blue", ms=10, alpha=0.6)
+    ax.axvline(g[-1], color="tab:red", lw=1.5, label=f"newest gap ({g[-1]:.0f}s)")
+    if training:
+        ax.axvline(np.median(g), color="tab:green", ls="--",
+                   label=f"median ({np.median(g):.0f}s)")
+        ax.axvline(g.mean(), color="tab:orange", ls="--",
+                   label=f"average ({g.mean():.0f}s)")
+    ax.set_xlim(0, top); ax.set_yticks([]); ax.set_xlabel("gap between calls (s)")
+    ax.set_title(f"Distribution of gaps — {len(g)} observed")
+    ax.legend(frameon=False, fontsize=8)
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
+    st.pyplot(fig)
+    plt.close(fig)
+
+
 # ---------------- app ----------------
 # ?instructor=1  expands the class panel and shows the reset button
 # ?view=board    projector view: leaderboard + class results, auto-refreshing
@@ -297,9 +325,15 @@ with left:
         plt.close(fig)
     else:
         st.info("No call history yet \u2014 start a new game.")
-    recent = ", ".join(f"{g:.0f}s" for g in st.session_state.gaps[-6:])
-    st.write(f"Most recent gaps between calls: {recent}")
+    gaps = st.session_state.gaps
+    listed = [f"{g:.0f}s" for g in gaps]
+    if listed:
+        listed[-1] = f"**{listed[-1]}**"  # newest gap, matching the strip's right end
+    st.markdown(f"Gaps between calls, oldest → newest ({len(gaps)}): "
+                + ", ".join(listed))
     st.caption("Use this history to judge the typical time between calls before you bet.")
+    if len(gaps) >= 2:
+        gap_distribution(np.array(gaps), st.session_state.get("training", True))
 
 with right:
     ranking = [e["name"].lower() for e in board_rows()]
@@ -309,7 +343,8 @@ with right:
     st.caption(f"**{st.session_state.callsign}** · Round "
                f"{len(st.session_state.history)} of {ROUNDS}"
                + (f" · leaderboard {place}" if place else ""))
-    training = st.toggle("Training mode (explain each line)", value=True)
+    training = st.toggle("Training mode (explain each line)", value=True,
+                         key="training")
     if training:
         g = np.array(st.session_state.gaps)
         st.markdown(f"**Your data so far** ({len(g)} gaps)  \n"
